@@ -178,6 +178,10 @@ MAX_GROUPS_TRIED = 2
 SPECIALS_SEASON = 0
 # How far a TMDB season's first-episode year may sit from AniList's, and still be the same season.
 SEASON_YEAR_SLACK = 1
+# How far a run's opening episode may sit from AniList's start date and still be that season's
+# first. Wide enough for a premiere screened early or held back a fortnight, and nowhere near the
+# months that separate one season from the next. Matches the app's own SEASON_OPENER_TOLERANCE_DAYS.
+SEASON_OPENER_TOLERANCE_DAYS = 21
 
 
 def series_search_query(raw: str | None) -> str | None:
@@ -235,6 +239,64 @@ def _year_of(date: str | None) -> int | None:
         return None
 
 
+def _days_apart(date: str | None, other: str | None) -> int | None:
+    """Days between two `YYYY-MM-DD` dates, or None unless both are whole dates."""
+    if not date or not other:
+        return None
+    try:
+        left = datetime.strptime(date[:10], "%Y-%m-%d")
+        right = datetime.strptime(other[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    return abs((left - right).days)
+
+
+def nearest_opener(candidates: list[dict], first_air, wanted_start: str | None) -> dict | None:
+    """The candidate whose first episode aired nearest the AniList entry's own start date.
+
+    A year says which *broadcast* year a run belongs to, and a two-cour series has two runs in one
+    year — so the year cannot separate them and whichever came first in the list won. That is how
+    Space Dandy 2 (thirteen episodes, July 2014) was given season one's thirteen episodes of
+    January 2014, and Bungou Stray Dogs 2nd Season season one's.
+
+    The day can separate them, because TMDB dates a cour to the day and AniList's `startDate` is
+    the same broadcast. Nearest rather than equal: the two catalogues disagree by a day whenever
+    one recorded a broadcast date and the other a streaming one — Space Dandy's own first season is
+    5 January on AniList and 4 January on TMDB — and demanding equality would throw away the match
+    over it. A tie is left undecided rather than guessed; something later can still answer.
+    """
+    if not wanted_start:
+        return None
+    scored = []
+    for candidate in candidates:
+        distance = _days_apart(first_air(candidate), wanted_start)
+        if distance is not None and distance <= SEASON_OPENER_TOLERANCE_DAYS:
+            scored.append((distance, candidate))
+    if not scored:
+        return None
+    best = min(distance for distance, _ in scored)
+    winners = [candidate for distance, candidate in scored if distance == best]
+    return winners[0] if len(winners) == 1 else None
+
+
+def _group_first_air(group: dict) -> str | None:
+    """The air date of an episode group run's first episode."""
+    episodes = group.get("episodes") or []
+    return episodes[0].get("air_date") if episodes else None
+
+
+def opens_when_season_does(raw: list[dict], wanted_start: str | None) -> bool:
+    """Whether a run of TMDB episodes begins when the AniList season it is claimed for began.
+
+    Nothing to compare is not evidence against a match, so a partial AniList date or a TMDB episode
+    with no date of its own passes — the same rule the year slack follows.
+    """
+    if not wanted_start or not raw:
+        return True
+    distance = _days_apart(raw[0].get("air_date"), wanted_start)
+    return distance is None or distance <= SEASON_OPENER_TOLERANCE_DAYS
+
+
 def is_sequel(entry: dict) -> bool:
     """Whether the AniList title names itself a later season, part or cour.
 
@@ -253,13 +315,16 @@ def pick_season(
     wanted_episodes: int | None,
     wanted_year: int | None,
     sequel: bool = False,
+    wanted_start: str | None = None,
 ) -> dict | None:
     """The TMDB season holding the AniList season being built, or None when a group split is needed.
 
-    An exact episode count is the strongest signal available and the year is only a tie-break. A
-    season of the wrong length is refused even when its year is the only one that fits: TMDB holds
-    Dandadan's two AniList seasons as one season of 24 aired in 2024, and matching on year alone
-    would hand the twelve-episode first season a twenty-four episode run.
+    An exact episode count is the strongest signal available and the date it started is the
+    tie-break. A season of the wrong length is refused even when its year is the only one that
+    fits: TMDB holds Dandadan's two AniList seasons as one season of 24 aired in 2024, and matching
+    on year alone would hand the twelve-episode first season a twenty-four episode run. The date is
+    a tie-break rather than a rule of its own for the same reason — that merged season begins on
+    exactly the day AniList's first season does.
 
     A count that is unique but lands years away from the entry is not decided here at all — see
     [far_year_season], which the caller tries only after the episode groups have had their turn.
@@ -269,6 +334,11 @@ def pick_season(
         return None
     if wanted_episodes is not None:
         same_count = [s for s in real if s.get("episode_count") == wanted_episodes]
+        # Two cours of one series are the same length in the same year, so the year below cannot
+        # separate them and returns whichever TMDB listed first — see [nearest_opener].
+        opener = nearest_opener(same_count, lambda s: s.get("air_date"), wanted_start)
+        if opener:
+            return opener
         for season in same_count:
             if _year_of(season.get("air_date")) == wanted_year:
                 return season
@@ -356,18 +426,40 @@ def whole_series_seasons(entry: dict, seasons: list[dict], sequel: bool) -> list
     return numbered if len(numbered) > 1 else []
 
 
-def pick_group(groups: list[dict], wanted_episodes: int | None, wanted_year: int | None) -> dict | None:
-    """The run of a "Seasons" episode group that holds the AniList season being built."""
+def pick_group(
+    groups: list[dict],
+    wanted_episodes: int | None,
+    wanted_year: int | None,
+    wanted_start: str | None = None,
+) -> dict | None:
+    """The run of a "Seasons" episode group that holds the AniList season being built.
+
+    Unlike the seasons above, these runs *are* the broadcast split, so a run beginning on the day
+    the AniList season began is that season however long TMDB made it. Bungou Stray Dogs is why
+    that last rule exists: its whole 60-episode run is one TMDB season, and the group that splits
+    it back into cours gives the second cour thirteen episodes — its twelve, plus the OVA that
+    AniList files as a separate entry. Thirteen is not twelve, so the count rule refused it and the
+    year then handed the 2016 autumn season the 2016 spring one's twelve episodes: every episode of
+    season two showed season one's title and still. An extra episode on the end of the right run
+    costs nothing, because a run longer than the season is cut back to it by air date on the device.
+    """
     real = [g for g in groups if g.get("episodes")]
     if not real:
         return None
 
     def first_year(group: dict) -> int | None:
-        episodes = group.get("episodes") or []
-        return _year_of(episodes[0].get("air_date")) if episodes else None
+        return _year_of(_group_first_air(group))
 
     if wanted_episodes is not None:
         same_count = [g for g in real if len(g.get("episodes") or []) == wanted_episodes]
+        # The right length and the right day; then the right day at any length, which beats the
+        # year below because these runs are the broadcast split and a run starting within a
+        # fortnight of the entry *is* that broadcast, while a same-year run is the other cour.
+        opener = nearest_opener(same_count, _group_first_air, wanted_start) or nearest_opener(
+            real, _group_first_air, wanted_start
+        )
+        if opener:
+            return opener
         for group in same_count:
             if first_year(group) == wanted_year:
                 return group
@@ -376,7 +468,7 @@ def pick_group(groups: list[dict], wanted_episodes: int | None, wanted_year: int
         same_year = [g for g in real if first_year(g) == wanted_year]
         if len(same_year) == 1:
             return same_year[0]
-    return None
+    return nearest_opener(real, _group_first_air, wanted_start)
 
 
 def to_episodes(raw: list[dict]) -> list[dict]:
@@ -771,6 +863,7 @@ class Tmdb:
     ) -> tuple[list[dict], int | None]:
         """Episode rows for one AniList title, plus the TMDB series id they came from."""
         wanted_episodes = entry.get("episodes")
+        wanted_start = _iso_air_date(entry.get("startDate"))
 
         # Fribb names the season outright, which is the one thing the heuristics below cannot do,
         # so it is tried first — but checked, not believed. What it states is a logical season that
@@ -778,11 +871,22 @@ class Tmdb:
         # that series carries a single season of 24. So the season is fetched, and it is only
         # accepted when it comes back the length AniList says the season is. Anything else falls
         # through to the matching below, which is what found the right answer for that title.
+        #
+        # The length is not enough on its own, because Fribb does not always distinguish a sequel
+        # from the season it follows: it files Space Dandy and Space Dandy 2 as season 1 of the same
+        # series, and both cours are thirteen episodes, so the length check passed and the second
+        # season was shown the first's. The day the run opens is the other half of the check —
+        # against a *held* answer rather than an outright rejection, since Fribb naming the season
+        # is still better evidence than anything below, and a season that only disagrees about the
+        # date is better than a title with no episodes at all.
+        held: list[dict] | None = None
         if fribb and fribb.tmdb_id and fribb.tmdb_season:
             payload = self.get(f"/tv/{fribb.tmdb_id}/season/{fribb.tmdb_season}")
             raw = (payload or {}).get("episodes") or []
             if raw and (wanted_episodes is None or len(raw) == wanted_episodes):
-                return to_episodes(raw), fribb.tmdb_id
+                if opens_when_season_does(raw, wanted_start):
+                    return to_episodes(raw), fribb.tmdb_id
+                held = raw
             # The season is the wrong length for this entry alone, which is what a split cour looks
             # like: several AniList entries sharing one broadcast season. Their counts say where
             # each begins, but only once they are shown to account for this exact season — see
@@ -798,7 +902,7 @@ class Tmdb:
         # a dead mirror. It still has to survive titles_match like any other candidate.
         series = self.resolve_series(entry, fribb.tmdb_id if fribb and fribb.tmdb_id else hint_id)
         if not series:
-            return [], None
+            return (to_episodes(held), fribb.tmdb_id) if held else ([], None)
         series_id = series.get("id")
         start = entry.get("startDate") or {}
         wanted_year = entry.get("seasonYear") or start.get("year")
@@ -826,7 +930,7 @@ class Tmdb:
             if run:
                 return to_episodes(run), series_id
 
-        summary = pick_season(seasons, wanted_episodes, wanted_year, sequel)
+        summary = pick_season(seasons, wanted_episodes, wanted_year, sequel, wanted_start)
         if summary:
             season = self.get(f"/tv/{series_id}/season/{summary['season_number']}")
             raw = (season or {}).get("episodes") or []
@@ -844,7 +948,9 @@ class Tmdb:
         groups.sort(key=lambda g: g.get("episode_count") or 0, reverse=True)
         for group in groups[:MAX_GROUPS_TRIED]:
             detail = self.get(f"/tv/episode_group/{group['id']}")
-            matched = pick_group((detail or {}).get("groups") or [], wanted_episodes, wanted_year)
+            matched = pick_group(
+                (detail or {}).get("groups") or [], wanted_episodes, wanted_year, wanted_start
+            )
             if matched:
                 return to_episodes(matched.get("episodes") or []), series_id
 
@@ -855,6 +961,11 @@ class Tmdb:
         single = self.specials_episode(entry, series_id, wanted_episodes)
         if single:
             return single, series_id
+
+        # Nothing on this series' own terms beat the season Fribb named, so its date disagreement is
+        # forgiven and it is used after all — see the check that held it back.
+        if held:
+            return to_episodes(held), fribb.tmdb_id
 
         # Nothing lines up on this series' own terms, so the count match whose year did not fit is
         # taken after all rather than leaving the title with no episodes at all.
@@ -1224,9 +1335,14 @@ def cmd_emit(args: argparse.Namespace) -> int:
     fribb = load_fribb(args.refresh_fribb)
     print(f"fribb cross-reference: {len(fribb)} AniList ids")
 
+    # Independently published dub positives must survive a clean episode-tree rebuild.
+    dub_path = out / "dub-index.json"
+    dub_index = dub_path.read_bytes() if dub_path.is_file() else None
     if out.exists() and args.clean:
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
+    if dub_index is not None:
+        dub_path.write_bytes(dub_index)
 
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     index_rows: list[dict] = []
