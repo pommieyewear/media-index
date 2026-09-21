@@ -155,21 +155,29 @@ jobs:
 
       # jsDelivr caches a branch reference for up to twelve hours and does not watch for pushes, so
       # without this the commit above reaches no device until the cache expires on its own.
+      # Two spellings of this repo, not one. It was renamed from `anilili-metadata` on 2026-09-21;
+      # GitHub redirects the old name and jsDelivr follows it, so builds released before the rename
+      # still read this tree. But jsDelivr keys its cache on the URL, so the old name is a
+      # *separate* set of cached objects that purging the current name does not touch. Purge only
+      # one and half the installed base sits on a twelve-hour-stale tree with nothing in the logs
+      # to explain it. Drop the legacy entry once builds older than 0.1.80 are gone.
       - name: Purge jsDelivr
         if: steps.commit.outputs.changed == 'true'
         run: |
-          for path in dub-index.json index.json id-map.json airing.json stats.json sync-status.json; do
-            curl -sS "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/data/$path" > /dev/null
+          for repo in "${{ github.repository }}" pommieyewear/anilili-metadata; do
+            for path in dub-index.json index.json id-map.json airing.json stats.json sync-status.json; do
+              curl -sS "https://purge.jsdelivr.net/gh/$repo@main/data/$path" > /dev/null
+            done
+            # Named here rather than left to the diff below, which cannot reach them: it is capped
+            # at 2000 paths and a refresh changes tens of thousands under data/anime/, which sorts
+            # first. A schedule file rewritten daily and never purged is a calendar that goes stale
+            # for half a day at a time, which is the one thing this file exists to prevent.
+            for month in $(ls data/schedule 2>/dev/null); do
+              curl -sS "https://purge.jsdelivr.net/gh/$repo@main/data/schedule/$month" > /dev/null
+            done
+            git diff --name-only HEAD~1 HEAD -- data \
+              | sed 's|^data/||' \
+              | head -n 2000 \
+              | xargs -P 16 -I {} curl -sS -o /dev/null \
+                  "https://purge.jsdelivr.net/gh/$repo@main/data/{}"
           done
-          # Named here rather than left to the diff below, which cannot reach them: it is capped at
-          # 2000 paths and a refresh changes tens of thousands under data/anime/, which sorts first.
-          # A schedule file rewritten daily and never purged is a calendar that goes stale for half
-          # a day at a time, which is the one thing this file exists to prevent.
-          for month in $(ls data/schedule 2>/dev/null); do
-            curl -sS "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/data/schedule/$month" > /dev/null
-          done
-          git diff --name-only HEAD~1 HEAD -- data \
-            | sed 's|^data/||' \
-            | head -n 2000 \
-            | xargs -P 16 -I {} curl -sS -o /dev/null \
-                "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/data/{}"
