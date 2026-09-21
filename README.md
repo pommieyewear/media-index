@@ -1,4 +1,4 @@
-# anilili-metadata
+# media-index
 
 Static anime metadata — title details, episode lists, and cross-database id mapping — aggregated
 from [AniList](https://anilist.co) and [TMDB](https://www.themoviedb.org), served over the jsDelivr
@@ -9,8 +9,12 @@ Rebuilt daily by a GitHub Action. Roughly 20,800 titles and 135,000 episodes.
 ## Data access
 
 ```
-https://cdn.jsdelivr.net/gh/pommieyewear/anilili-metadata@main/data
+https://cdn.jsdelivr.net/gh/pommieyewear/media-index@main/data
 ```
+
+Renamed from `anilili-metadata` on 2026-09-21. The old URL still resolves — GitHub redirects a
+renamed repository and jsDelivr follows the redirect — so anything already pointing at it keeps
+working, but new consumers should use the name above.
 
 | File | Contents |
 | --- | --- |
@@ -28,7 +32,7 @@ https://cdn.jsdelivr.net/gh/pommieyewear/anilili-metadata@main/data
 mappings on the MyAnimeList id.
 
 ```javascript
-const BASE = "https://cdn.jsdelivr.net/gh/pommieyewear/anilili-metadata@main/data";
+const BASE = "https://cdn.jsdelivr.net/gh/pommieyewear/media-index@main/data";
 
 const catalog = await fetch(`${BASE}/index.json`).then(r => r.json());
 
