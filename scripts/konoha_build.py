@@ -55,11 +55,33 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORK = ROOT / "build" / "konoha"
 CATALOG_FILE = WORK / "catalog.json"
 EPISODE_DIR = WORK / "episodes"
+ANIZIP_DIR = WORK / "anizip"
 ASSETS = ROOT / "app/src/main/assets"
 
 ANILIST_API = "https://graphql.anilist.co"
 TMDB_API = "https://api.themoviedb.org/3"
 TMDB_STILL_BASE = "https://image.tmdb.org/t/p/w500"
+
+# AniZip: a keyless mapping service that answers for one AniList id with TheTVDB's artwork and
+# episode rows. Two fields here are things no other source in this build has:
+#
+#   images[].Clearlogo   the series' name as its own transparent PNG. AniList publishes a cover and
+#                        a banner, both pictures of the show; TMDB the same. A ten-foot header that
+#                        sets the title in the app's font looks like a database, not like the show.
+#   episodes[].rating    what viewers scored one episode. TMDB states `vote_average` only for the
+#                        seasons somebody has voted on, which is almost none of this catalogue.
+#
+# Measured coverage 2026-09-21, sampling the published index: 38 of the 40 most popular titles have
+# a logo (the two misses are films) and all 40 have episode ratings; across 40 drawn at random from
+# all 20,811 it falls to 11 and 15. That shape is the right way round — the long tail nobody opens
+# is where the gaps are — and it is why the fields are optional everywhere downstream rather than
+# something the app waits for.
+ANIZIP_API = "https://api.ani.zip/mappings"
+
+# AniZip is a small community service and this walks the whole catalogue against it. One request at
+# a time with a gap between them: a full pass is unattended and slow either way, and there is no
+# version of this that is worth being the reason the service falls over.
+ANIZIP_MIN_INTERVAL = 0.25
 
 # Fribb's anime-lists: a community cross-reference pairing an AniList id with its AniDB, MAL, Kitsu,
 # Simkl, TVDB and TMDB ids, and — the part nothing else states — which TMDB *season* that AniList
@@ -1090,6 +1112,116 @@ def cmd_episodes(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------------------------
+# AniZip
+# --------------------------------------------------------------------------------------------
+
+
+def anizip_payload(session: requests.Session, anilist_id: int) -> dict:
+    """The logo and per-episode scores AniZip holds for one AniList id, in the cache's own shape.
+
+    Reduced here rather than at emit time so a cached file is small and stable: the upstream
+    response carries every title in thirty languages and every episode's synopsis, none of which
+    this tree takes — it has TMDB's for that, and mixing two numbering schemes inside one episode
+    list is how an episode ends up described as a different episode.
+
+    A title AniZip has never heard of caches as an empty answer, so the next pass does not ask
+    again. That is the common case for the long tail and it is not an error.
+    """
+    response = session.get(ANIZIP_API, params={"anilist_id": anilist_id}, timeout=30)
+    if response.status_code == 404:
+        return {"logo": None, "ratings": {}}
+    response.raise_for_status()
+    body = response.json()
+
+    logo = None
+    for image in body.get("images") or []:
+        if str(image.get("coverType", "")).lower() == "clearlogo" and image.get("url"):
+            logo = image["url"]
+            break
+
+    ratings: dict[str, float] = {}
+    for key, episode in (body.get("episodes") or {}).items():
+        # Specials are keyed "S1", "P91" and so on. They are numbered in a run of their own that
+        # has nothing to do with the episode numbers the app keys by, so a score from one would
+        # land on an unrelated episode.
+        if not key.isdigit():
+            continue
+        raw = episode.get("rating")
+        if raw in (None, ""):
+            continue
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            continue
+        # A zero is "nobody has scored this", the same as TMDB's, and must not be shown as a score.
+        if score > 0:
+            ratings[str(int(key))] = round(score, 2)
+
+    return {"logo": logo, "ratings": ratings}
+
+
+def load_anizip(anilist_id: int) -> dict:
+    """One title's cached AniZip answer, or an empty one when the pass has not reached it."""
+    path = ANIZIP_DIR / f"{anilist_id}.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def cmd_anizip(args: argparse.Namespace) -> int:
+    catalog = load_catalog()
+    ANIZIP_DIR.mkdir(parents=True, exist_ok=True)
+
+    targets = []
+    for entry in catalog:
+        if args.airing_only and entry.get("status") not in {"RELEASING", "NOT_YET_RELEASED"}:
+            continue
+        if (ANIZIP_DIR / f"{entry['id']}.json").exists() and not args.refresh:
+            continue
+        targets.append(entry)
+    # Coverage is not spread evenly and neither is attention: the titles anyone opens nearly all
+    # have a logo, and the long tail nearly all does not. Walking in popularity order means a run
+    # that is stopped — or a --limit that is deliberately short — has still fetched the artwork for
+    # everything a viewer is likely to see, rather than for whichever ids happen to sort first.
+    if args.popular_first:
+        targets.sort(key=lambda entry: entry.get("popularity") or 0, reverse=True)
+    if args.limit:
+        targets = targets[: args.limit]
+
+    print(f"{len(targets)} titles to fetch (one at a time, {ANIZIP_MIN_INTERVAL}s apart)", flush=True)
+    session = requests.Session()
+    session.headers["User-Agent"] = "anilili-media-index/1.0"
+    done = 0
+    with_logo = 0
+    with_ratings = 0
+    for entry in targets:
+        anilist_id = entry["id"]
+        try:
+            payload = anizip_payload(session, anilist_id)
+        except Exception as error:  # noqa: BLE001 - one bad title must not end an hours-long run
+            print(f"  !! {anilist_id} {error}", flush=True)
+            time.sleep(ANIZIP_MIN_INTERVAL)
+            continue
+        (ANIZIP_DIR / f"{anilist_id}.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        done += 1
+        if payload.get("logo"):
+            with_logo += 1
+        if payload.get("ratings"):
+            with_ratings += 1
+        if done % 100 == 0:
+            print(f"  {done}/{len(targets)} ({with_logo} logos, {with_ratings} rated)", flush=True)
+        time.sleep(ANIZIP_MIN_INTERVAL)
+
+    print(f"\ndone: {done} fetched, {with_logo} with a logo, {with_ratings} with episode scores")
+    return 0
+
+
+# --------------------------------------------------------------------------------------------
 # Schedule
 # --------------------------------------------------------------------------------------------
 #
@@ -1413,6 +1545,12 @@ def cmd_emit(args: argparse.Namespace) -> int:
                 "banner": entry.get("bannerImage"),
             },
         }
+        anizip = load_anizip(anilist_id)
+        # Written only when there is one. An absent key and a null both read as "no logo" to the
+        # app, and the tree is served to every device on every title page — a null per title is
+        # 20,811 nulls on the wire for nothing.
+        if anizip.get("logo"):
+            detail["images"]["logo"] = anizip["logo"]
         shard = anilist_id // 1000
         _write(out / "anime" / str(shard) / str(anilist_id) / "index.json", detail)
 
@@ -1423,6 +1561,17 @@ def cmd_emit(args: argparse.Namespace) -> int:
             payload = json.loads(cached.read_text(encoding="utf-8"))
             episodes = payload.get("episodes") or []
             tmdb_id = payload.get("tmdb_id")
+            # TMDB stays the source for what an episode is called and looks like; AniZip supplies
+            # only the score, keyed by the same position-based number the rows already carry.
+            ratings = anizip.get("ratings") or {}
+            if ratings:
+                for episode in episodes:
+                    number = episode.get("number")
+                    if number is None:
+                        continue
+                    score = ratings.get(str(int(number)))
+                    if score is not None:
+                        episode["rating"] = score
             if episodes:
                 _write(episodes_path, episodes)
                 episode_count += len(episodes)
@@ -1594,6 +1743,23 @@ def main(argv: list[str]) -> int:
         help="only RELEASING/NOT_YET_RELEASED titles — the daily refresh",
     )
     episodes.set_defaults(func=cmd_episodes)
+
+    anizip = commands.add_parser(
+        "anizip", help="fetch AniZip logos and episode scores (keyless; slow by design)"
+    )
+    anizip.add_argument("--limit", type=int, default=0)
+    anizip.add_argument(
+        "--popular-first",
+        action="store_true",
+        help="walk the catalogue most-opened first, so a short run still covers what viewers see",
+    )
+    anizip.add_argument("--refresh", action="store_true", help="re-fetch titles already cached")
+    anizip.add_argument(
+        "--airing-only",
+        action="store_true",
+        help="only RELEASING/NOT_YET_RELEASED titles — the daily refresh",
+    )
+    anizip.set_defaults(func=cmd_anizip)
 
     schedule = commands.add_parser("schedule", help="write per-month airing times for the calendar")
     schedule.add_argument("--out", default=str(WORK / "data"))
