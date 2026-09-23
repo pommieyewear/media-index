@@ -61,6 +61,8 @@ ASSETS = ROOT / "app/src/main/assets"
 ANILIST_API = "https://graphql.anilist.co"
 TMDB_API = "https://api.themoviedb.org/3"
 TMDB_STILL_BASE = "https://image.tmdb.org/t/p/w500"
+# Logos at w500: wide enough for the TV detail header, and still a PNG with its transparency.
+TMDB_LOGO_BASE = "https://image.tmdb.org/t/p/w500"
 
 # AniZip: a keyless mapping service that answers for one AniList id with TheTVDB's artwork and
 # episode rows. Two fields here are things no other source in this build has:
@@ -1116,7 +1118,43 @@ def cmd_episodes(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------------------------
 
 
-def anizip_payload(session: requests.Session, anilist_id: int) -> dict:
+def tmdb_logo(session: requests.Session, token: str, tmdb_id: int) -> tuple[str | None, bool]:
+    """The best English logo TMDB holds for a series, and whether it holds only Japanese ones.
+
+    AniZip passes TVDB's clearlogo along with no language on it, and for anime that is often the
+    Japanese wordmark (転生したらスライムだった件 where the viewer reads "That Time I Got
+    Reincarnated as a Slime"). TMDB tags every logo with its language: on the 253 titles first
+    published with a logo, 245 had an English one there. Measured 2026-09-23.
+
+    PNG only - TMDB also hosts SVG logos, which the app's image loader cannot decode from a URL
+    without an extension it recognises. Best is the highest-voted, then the most-voted, which is
+    how TMDB's own site orders them.
+    """
+    response = session.get(
+        f"{TMDB_API}/tv/{tmdb_id}/images",
+        params={"include_image_language": "en,ja,null"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    if response.status_code == 404:
+        return None, False
+    response.raise_for_status()
+    logos = response.json().get("logos") or []
+    english = [
+        logo for logo in logos
+        if logo.get("iso_639_1") == "en" and str(logo.get("file_path", "")).lower().endswith(".png")
+    ]
+    english.sort(key=lambda logo: (logo.get("vote_average") or 0, logo.get("vote_count") or 0), reverse=True)
+    japanese_only = bool(logos) and not english and all(logo.get("iso_639_1") == "ja" for logo in logos)
+    return (TMDB_LOGO_BASE + english[0]["file_path"]) if english else None, japanese_only
+
+
+def anizip_payload(
+    session: requests.Session,
+    anilist_id: int,
+    tmdb_id: int | None = None,
+    tmdb_token: str | None = None,
+) -> dict:
     """The logo and per-episode scores AniZip holds for one AniList id, in the cache's own shape.
 
     Reduced here rather than at emit time so a cached file is small and stable: the upstream
@@ -1129,15 +1167,28 @@ def anizip_payload(session: requests.Session, anilist_id: int) -> dict:
     """
     response = session.get(ANIZIP_API, params={"anilist_id": anilist_id}, timeout=30)
     if response.status_code == 404:
-        return {"logo": None, "ratings": {}}
-    response.raise_for_status()
-    body = response.json()
+        # Unknown to AniZip is not unknown to TMDB: the English logo below is still worth asking for.
+        body = {}
+    else:
+        response.raise_for_status()
+        body = response.json()
 
     logo = None
     for image in body.get("images") or []:
         if str(image.get("coverType", "")).lower() == "clearlogo" and image.get("url"):
             logo = image["url"]
             break
+    # English first. The logo stands in for the title on the anime page, so one the viewer cannot
+    # read is worse than none: the page falls back to the title in text. Where TMDB has only
+    # Japanese logos, TVDB's is almost certainly Japanese too, so it is dropped; where TMDB knows
+    # nothing, TVDB's is kept, since there is nothing to say it is not English.
+    logo_source = "tvdb" if logo else None
+    if tmdb_id and tmdb_token:
+        english, japanese_only = tmdb_logo(session, tmdb_token, tmdb_id)
+        if english:
+            logo, logo_source = english, "tmdb-en"
+        elif japanese_only:
+            logo, logo_source = None, None
 
     ratings: dict[str, float] = {}
     for key, episode in (body.get("episodes") or {}).items():
@@ -1157,7 +1208,7 @@ def anizip_payload(session: requests.Session, anilist_id: int) -> dict:
         if score > 0:
             ratings[str(int(key))] = round(score, 2)
 
-    return {"logo": logo, "ratings": ratings}
+    return {"logo": logo, "logo_source": logo_source, "ratings": ratings}
 
 
 def load_anizip(anilist_id: int) -> dict:
@@ -1194,13 +1245,36 @@ def cmd_anizip(args: argparse.Namespace) -> int:
     print(f"{len(targets)} titles to fetch (one at a time, {ANIZIP_MIN_INTERVAL}s apart)", flush=True)
     session = requests.Session()
     session.headers["User-Agent"] = "anilili-media-index/1.0"
+    # The same TMDB series id emit writes: the episode resolver's own answer first, the Fribb
+    # mapping second. Never the bundled id-map, whose TMDB ids are known to be wrong.
+    try:
+        token = tmdb_token(None)
+    except SystemExit:
+        # This pass predates the English logos and never needed a key; without one it still
+        # fetches everything it used to, just without the English preference.
+        print("  no TMDB token: logos stay AniZip's, whatever their language", flush=True)
+        token = None
+    fribb = load_fribb()
+
+    def tmdb_id_for(anilist_id: int) -> int | None:
+        cached = EPISODE_DIR / f"{anilist_id}.json"
+        if cached.exists():
+            try:
+                found = json.loads(cached.read_text(encoding="utf-8")).get("tmdb_id")
+            except (OSError, json.JSONDecodeError):
+                found = None
+            if found:
+                return found
+        cross = fribb.get(anilist_id)
+        return cross.tmdb_id if cross and cross.tmdb_id else None
+
     done = 0
     with_logo = 0
     with_ratings = 0
     for entry in targets:
         anilist_id = entry["id"]
         try:
-            payload = anizip_payload(session, anilist_id)
+            payload = anizip_payload(session, anilist_id, tmdb_id_for(anilist_id), token)
         except Exception as error:  # noqa: BLE001 - one bad title must not end an hours-long run
             print(f"  !! {anilist_id} {error}", flush=True)
             time.sleep(ANIZIP_MIN_INTERVAL)
