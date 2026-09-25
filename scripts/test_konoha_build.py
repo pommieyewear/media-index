@@ -20,6 +20,7 @@ from konoha_build import (
     forward_months,
     is_sequel,
     normalize_title,
+    opens_when_season_does,
     pick_group,
     pick_season,
     schedule_days,
@@ -118,6 +119,28 @@ AMBIGUOUS = [
     {"season_number": 2, "episode_count": 12, "air_date": "2021-01-01"},
 ]
 check("ambiguous count with no year match", pick_season(AMBIGUOUS, 12, 2024), None)
+
+# Space Dandy, live: TMDB keeps its two cours as two seasons of thirteen, both aired in 2014, so
+# the year cannot separate them and the first in the list won — season two was given season one's
+# January episodes. Its start date can separate them, and does so to the day.
+TWO_COURS = [
+    {"season_number": 1, "episode_count": 13, "air_date": "2014-01-04"},
+    {"season_number": 2, "episode_count": 13, "air_date": "2014-07-06"},
+]
+check("the cour that started when this season did",
+      pick_season(TWO_COURS, 13, 2014, wanted_start="2014-07-06"), TWO_COURS[1])
+# AniList dates that same first season 5 January where TMDB dates it the 4th, which is what nearest
+# rather than exact is for: demanding equality would throw the match away over a day.
+check("a day apart is still the same broadcast",
+      pick_season(TWO_COURS, 13, 2014, wanted_start="2014-01-05"), TWO_COURS[0])
+# Without a date there is nothing new to say, and the old year rule still answers.
+check("no start date leaves the year rule in charge",
+      pick_season(TWO_COURS, 13, 2014), TWO_COURS[0])
+# The date is a tie-break among seasons of the right length, not a rule of its own: TMDB's merged
+# Dandadan season begins on exactly the day AniList's first season does, and taking it on the date
+# would undo the count rule directly above.
+check("an exact date cannot rescue a season of the wrong length",
+      pick_season(MERGED, 12, 2024, wanted_start="2024-10-03"), None)
 check("unambiguous single season with no count", pick_season(SLIPPED, None, None), SLIPPED[0])
 check("no real seasons", pick_season([{"season_number": 0, "episode_count": 3}], 3, 2024), None)
 
@@ -147,6 +170,20 @@ check("so it is not demoted", far_year_season(SLIPPED, 12, 2024), None)
 check("an exact year is never demoted", far_year_season(TITAN, 12, 2017), None)
 check("ambiguity is not a fallback either", far_year_season(AMBIGUOUS, 12, 2024), None)
 check("no count, nothing to demote", far_year_season(TITAN, None, 2022), None)
+
+# -- opens_when_season_does --------------------------------------------------------------------
+# The second half of the check on Fribb's named season. Fribb does not always distinguish a sequel
+# from the season it follows — it files Space Dandy and Space Dandy 2 as season 1 of the same
+# series — and both cours are thirteen episodes, so the length check passed on its own and the
+# second season was given the first's episodes.
+JANUARY = [{"air_date": "2014-01-04"}, {"air_date": "2014-01-11"}]
+check("a run that opens when the season did", opens_when_season_does(JANUARY, "2014-01-05"), True)
+check("a run that opens half a year out", opens_when_season_does(JANUARY, "2014-07-06"), False)
+# Nothing to compare is not evidence against a match, so it passes rather than discarding a season
+# over a date one side never stated.
+check("no start date to check against", opens_when_season_does(JANUARY, None), True)
+check("no air date on the run", opens_when_season_does([{"air_date": None}], "2014-07-06"), True)
+check("an empty run", opens_when_season_does([], "2014-07-06"), True)
 
 # -- _iso_air_date -----------------------------------------------------------------------------
 # A one-episode special is found by its date alone, so a partial date has to be refused rather than
@@ -186,6 +223,25 @@ check(
 # A stated count binds to a single season and is the stronger signal, so the run is not taken.
 counted = {"title": {"romaji": "Some Show"}, "episodes": 12}
 check("a stated count wins", whole_series_seasons(counted, LONG_RUN, sequel=False), [])
+# Naruto Shippuden: a count that is every season added up is the whole series after all.
+summed = {"title": {"romaji": "Naruto: Shippuuden"}, "episodes": 91}
+check(
+    "a count equal to the whole run takes every season",
+    [s["season_number"] for s in whole_series_seasons(summed, LONG_RUN, sequel=False)],
+    [1, 2, 3],
+)
+# Its "Released Order" group files episode 11 fifth; a shuffled run is never a season.
+check(
+    "shuffled group run refused",
+    pick_group(
+        [{"name": "S1", "episodes": [
+            {"season_number": 1, "episode_number": n, "air_date": "2007-02-15" if n == 1 else None}
+            for n in (1, 2, 3, 4, 11, 5, 6)
+        ]}],
+        7, 2007, "2007-02-15",
+    ),
+    None,
+)
 # A named sequel is one season of a longer run; the run is the one thing it must not be given.
 check("sequel never takes the run", whole_series_seasons(ongoing, LONG_RUN, sequel=True), [])
 # Sazae-san and Detective Conan arrive as a single TMDB season, so there is nothing to concatenate
@@ -205,8 +261,38 @@ GROUPS = [
     {"name": "Season 2", "episodes": [{"air_date": "2025-07-04"}] * 12},
 ]
 check("group by count and first air year", pick_group(GROUPS, 12, 2025), GROUPS[1])
-check("group with no count match", pick_group(GROUPS, 24, 2025), None)
 check("empty groups", pick_group([{"name": "x", "episodes": []}], 12, 2025), None)
+
+# Bungou Stray Dogs, live and the reason any of this changed. Its whole 60-episode run is a single
+# TMDB season, so only the episode group can split it, and that group gives the second cour
+# thirteen episodes — its twelve plus the OVA AniList files separately. Thirteen is not twelve, so
+# the count rule refused it and the year handed the autumn 2016 season the spring 2016 one's twelve
+# episodes: every row of season two carried season one's title and still.
+COURS = [
+    {"name": "1", "episodes": [{"air_date": "2016-04-07"}] + [{"air_date": None}] * 11},
+    {"name": "2", "episodes": [{"air_date": "2016-10-06"}] + [{"air_date": None}] * 12},
+    {"name": "3", "episodes": [{"air_date": "2019-04-12"}] + [{"air_date": None}] * 11},
+]
+check("a run of the wrong length that starts on the right day",
+      pick_group(COURS, 12, 2016, wanted_start="2016-10-06"), COURS[1])
+check("the first cour is still its own", pick_group(COURS, 12, 2016, wanted_start="2016-04-07"), COURS[0])
+check("and a later year is unaffected", pick_group(COURS, 12, 2019, wanted_start="2019-04-12"), COURS[2])
+# Without a start date this is the behaviour that shipped, kept so the fix is the date and not a
+# silent change to everything else.
+check("no start date leaves the year rule in charge", pick_group(COURS, 12, 2016), COURS[0])
+# A run months away from the season is not it, whatever its length.
+check("no run near this season", pick_group(COURS, 24, 2025, wanted_start="2025-01-06"), None)
+check("group with no count match", pick_group(GROUPS, 24, 2025), None)
+# The Apothecary Diaries, live: the air-date grouping's specials run opens the day after season one.
+APOTHECARY = [
+    {"name": "Season 1", "episodes": [{"air_date": "2023-10-22"}] * 24},
+    {"name": "Season 2", "episodes": [{"air_date": "2025-01-10"}] * 24},
+    {"name": "Specials", "episodes": [{"air_date": "2023-10-23"}] * 50},
+]
+check("season one beside its specials run",
+      pick_group(APOTHECARY, 24, 2023, wanted_start="2023-10-22"), APOTHECARY[0])
+check("a specials run is never a season, even at its own length",
+      pick_group(APOTHECARY, 50, 2023, wanted_start="2023-10-23"), APOTHECARY[0])
 
 # -- to_episodes -------------------------------------------------------------------------------
 # Inside a merged run TMDB numbers the second season 13..24 while AniList, the providers and the

@@ -154,9 +154,9 @@ query ($page: Int!, $perPage: Int!, $greater: FuzzyDateInt, $lesser: FuzzyDateIn
     ) {
       id
       idMal
-      title { romaji english native }
+      title { romaji english native userPreferred }
       description(asHtml: false)
-      coverImage { large color }
+      coverImage { large extraLarge color }
       bannerImage
       format
       status
@@ -166,14 +166,29 @@ query ($page: Int!, $perPage: Int!, $greater: FuzzyDateInt, $lesser: FuzzyDateIn
       duration
       genres
       averageScore
+      meanScore
       popularity
+      favourites
       isAdult
+      countryOfOrigin
+      tags { name rank isMediaSpoiler isGeneralSpoiler }
+      studios { nodes { id name isAnimationStudio } }
+      trailer { id site thumbnail }
       startDate { year month day }
+      endDate { year month day }
       nextAiringEpisode { episode airingAt }
+      relations { edges { relationType node { %(node)s } } }
+      recommendations(perPage: 10, sort: RATING_DESC) { nodes { rating mediaRecommendation { %(node)s } } }
     }
   }
 }
-"""
+""" % {
+    # What a card or a season tab needs of a title that is not the one on screen — the app's own
+    # `Media` decodes it, every field it lacks defaulting.
+    "node": "id idMal title { romaji english native userPreferred } coverImage { large extraLarge color } "
+    "bannerImage format status episodes duration season seasonYear averageScore popularity isAdult "
+    "countryOfOrigin genres startDate { year month day }",
+}
 
 
 # --------------------------------------------------------------------------------------------
@@ -194,10 +209,15 @@ SEASON_MARKERS = [
 # Below this a containment test stops meaning anything — "one" is inside a great many titles.
 MIN_TITLE_LENGTH = 6
 
-# TMDB's own type for the grouping that splits a run into broadcast seasons.
-SEASONS_GROUP_TYPE = 6
+# The TMDB grouping types that split a run by when it aired, most trusted first: production (6),
+# original air date (1) and TV (7). Which one a series' editors used is arbitrary — Dandadan and
+# Re:Zero carry a production split, while The Apothecary Diaries keeps all 60 episodes as one season
+# and splits them only by air date ("Seasons") and TV ("Cours"), so reading production alone left
+# both of its AniList seasons with no episode list. Absolute, DVD, digital and story-arc groupings
+# are not the broadcast seasons.
+SEASONS_GROUP_TYPES = (6, 1, 7)
 # Re:Zero carries eight groupings; trying them all would cost more than the stills are worth.
-MAX_GROUPS_TRIED = 2
+MAX_GROUPS_TRIED = 3
 # TMDB files everything that is not a numbered season under season 0.
 SPECIALS_SEASON = 0
 # How far a TMDB season's first-episode year may sit from AniList's, and still be the same season.
@@ -434,20 +454,42 @@ def whole_series_seasons(entry: dict, seasons: list[dict], sequel: bool) -> list
     after that with no title and no still.
 
     No episode count and no season marker means the entry *is* the series, so the whole run is the
-    answer. Empty when that does not hold, which leaves the ordinary season matching to decide:
+    answer. So does a stated count that is exactly the sum of every numbered season: Naruto
+    Shippuden is one AniList entry of 500 and twenty TMDB seasons adding up to 500, and with no
+    season that long the groups answered with a hand-edited 32-episode arc instead. Empty when
+    neither holds, which leaves the ordinary season matching to decide:
 
-    - A stated count binds to one season and is the stronger signal (see `pick_season`).
+    - Any other stated count binds to one season and is the stronger signal (see `pick_season`).
     - A named sequel is one season of a longer run, and the run is the one thing it must not get.
     - A series TMDB already keeps as a single season has nothing to concatenate — Sazae-san's 2,650
       and Detective Conan's 1,212 arrive that way and are unaffected either way.
     """
-    if entry.get("episodes") is not None or sequel:
+    if sequel:
         return []
     numbered = sorted(
         (s for s in seasons if (s.get("season_number") or 0) > 0 and (s.get("episode_count") or 0) > 0),
         key=lambda s: s["season_number"],
     )
-    return numbered if len(numbered) > 1 else []
+    if len(numbered) < 2:
+        return []
+    wanted = entry.get("episodes")
+    if wanted is not None and sum(s["episode_count"] for s in numbered) != wanted:
+        return []
+    return numbered
+
+
+def is_broadcast_order(episodes: list[dict]) -> bool:
+    """Whether a group run lists its episodes in TMDB's own broadcast numbering.
+
+    Episode groups are hand-edited, and Naruto Shippuden's "Released Order" grouping files episode 11
+    fifth in its first arc. Runs are numbered by position, so a shuffled run puts one episode's
+    title and still on another; a season's broadcast split — the only kind worth taking — counts up.
+    """
+    keys = [(e.get("season_number") or 0, e.get("episode_number") or 0) for e in episodes]
+    # A run without TMDB's numbering cannot be judged, and is not refused for it.
+    if any(number <= 0 for _, number in keys):
+        return True
+    return all(a < b for a, b in zip(keys, keys[1:]))
 
 
 def pick_group(
@@ -467,7 +509,15 @@ def pick_group(
     season two showed season one's title and still. An extra episode on the end of the right run
     costs nothing, because a run longer than the season is cut back to it by air date on the device.
     """
-    real = [g for g in groups if g.get("episodes")]
+    # A group's specials run is never a season, and it opens beside one: The Apothecary Diaries'
+    # starts the day after season one, near enough for the any-length opener rule to take it.
+    real = [
+        g
+        for g in groups
+        if g.get("episodes")
+        and not (g.get("name") or "").strip().lower().startswith("special")
+        and is_broadcast_order(g["episodes"])
+    ]
     if not real:
         return None
 
@@ -967,9 +1017,11 @@ class Tmdb:
         groups = [
             g
             for g in ((self.get(f"/tv/{series_id}/episode_groups") or {}).get("results") or [])
-            if g.get("type") == SEASONS_GROUP_TYPE and (g.get("group_count") or 0) > 1
+            if g.get("type") in SEASONS_GROUP_TYPES and (g.get("group_count") or 0) > 1
         ]
-        groups.sort(key=lambda g: g.get("episode_count") or 0, reverse=True)
+        groups.sort(
+            key=lambda g: (SEASONS_GROUP_TYPES.index(g["type"]), -(g.get("episode_count") or 0))
+        )
         for group in groups[:MAX_GROUPS_TRIED]:
             detail = self.get(f"/tv/episode_group/{group['id']}")
             matched = pick_group(
@@ -1526,6 +1578,65 @@ def _write(path: pathlib.Path, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
 
+# The app's own season-chain limits (MiruroRepository.MAX_SERIES_ENTRIES / MAX_SERIES_DEPTH).
+MAX_SERIES_ENTRIES = 16
+MAX_SERIES_DEPTH = 8
+
+
+def season_neighbors(entry: dict) -> list[int]:
+    """PREQUEL and SEQUEL relations, as `Media.seasonNeighbors` reads them in the app."""
+    ids: list[int] = []
+    for edge in ((entry.get("relations") or {}).get("edges") or []):
+        node = edge.get("node") or {}
+        if edge.get("relationType") in ("PREQUEL", "SEQUEL") and node.get("id") and node["id"] not in ids:
+            ids.append(node["id"])
+    return ids
+
+
+def series_chain(root_id: int, by_id: dict[int, dict]) -> list[int]:
+    """Every season reachable through prequel/sequel links, walked the way the app walks it.
+
+    A port of `walkSeriesChain`: breadth first from the title, at most MAX_SERIES_ENTRIES entries
+    and MAX_SERIES_DEPTH hops. The app used to do this one AniList request per season on every cold
+    open of a franchise; it is the same walk over the catalogue already in memory. Adult filtering
+    and airing order stay on the device, which knows the viewer's setting.
+    """
+    found = [root_id]
+    expanded: set[int] = set()
+    frontier = [root_id]
+    depth = 0
+    while frontier and len(found) < MAX_SERIES_ENTRIES and depth < MAX_SERIES_DEPTH:
+        batch = [i for i in frontier if i not in expanded][: MAX_SERIES_ENTRIES - len(found) + 1]
+        expanded.update(batch)
+        if not batch:
+            break
+        nxt: list[int] = []
+        for media_id in batch:
+            for neighbor in season_neighbors(by_id.get(media_id) or {}):
+                if neighbor not in found and len(found) < MAX_SERIES_ENTRIES:
+                    found.append(neighbor)
+                if neighbor not in expanded and neighbor not in nxt:
+                    nxt.append(neighbor)
+        frontier = nxt
+        depth += 1
+    return found
+
+
+def app_record(entry: dict) -> dict:
+    """The AniList record in the shape the app's `Media` decodes, minus what the tree says elsewhere.
+
+    Recommendations are left out here and written beside it; `nextAiringEpisode` stays, but the app
+    only trusts this record for titles that have stopped airing.
+    """
+    record = {k: v for k, v in entry.items() if k != "recommendations"}
+    return record
+
+
+def recommendation_nodes(entry: dict) -> list[dict]:
+    nodes = ((entry.get("recommendations") or {}).get("nodes")) or []
+    return [n["mediaRecommendation"] for n in nodes if n.get("mediaRecommendation") and (n.get("rating") or 0) > 0]
+
+
 def _slug(title: str, anilist_id: int) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
     return f"{base}-{anilist_id}" if base else str(anilist_id)
@@ -1560,6 +1671,7 @@ def cmd_emit(args: argparse.Namespace) -> int:
     statuses: dict[str, int] = {}
     episode_count = 0
 
+    by_id = {entry["id"]: entry for entry in catalog}
     for entry in catalog:
         anilist_id = entry["id"]
         titles = entry.get("title") or {}
@@ -1619,6 +1731,14 @@ def cmd_emit(args: argparse.Namespace) -> int:
                 "banner": entry.get("bannerImage"),
             },
         }
+        # The full record, the season chain and the recommendations, so a title page is built from
+        # the tree instead of from one AniList request per season plus one for the recommendations.
+        # Only written from a catalogue walked with the full query; an older work file has no
+        # relations, and a chain built from it would be every title alone.
+        if "relations" in entry:
+            detail["anilist"] = app_record(entry)
+            detail["series"] = series_chain(anilist_id, by_id)
+            detail["recommendations"] = recommendation_nodes(entry)
         anizip = load_anizip(anilist_id)
         # Written only when there is one. An absent key and a null both read as "no logo" to the
         # app, and the tree is served to every device on every title page — a null per title is
