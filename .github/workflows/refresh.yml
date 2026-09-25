@@ -78,8 +78,10 @@ jobs:
           mkdir -p build/konoha/anizip
           if [ -d anizip ]; then cp -r anizip/. build/konoha/anizip/; fi
           if [ -f data/dub-index.json ]; then cp data/dub-index.json /tmp/dub-index.json; fi
+          if [ -f data/filler-index.json ]; then cp data/filler-index.json /tmp/filler-index.json; fi
           python scripts/konoha_build.py emit --out data
           if [ -f /tmp/dub-index.json ]; then cp /tmp/dub-index.json data/dub-index.json; fi
+          if [ -f /tmp/filler-index.json ]; then cp /tmp/filler-index.json data/filler-index.json; fi
 
       # Two aliased AniList requests per month and seconds to run, so it rides along with the daily
       # refresh rather than earning a schedule of its own. Only the forward window is written: once
@@ -171,7 +173,7 @@ jobs:
         if: steps.commit.outputs.changed == 'true'
         run: |
           for repo in "${{ github.repository }}" pommieyewear/anilili-metadata; do
-            for path in dub-index.json index.json id-map.json airing.json stats.json sync-status.json; do
+            for path in dub-index.json filler-index.json index.json id-map.json airing.json stats.json sync-status.json; do
               curl -sS "https://purge.jsdelivr.net/gh/$repo@main/data/$path" > /dev/null
             done
             # Named here rather than left to the diff below, which cannot reach them: it is capped
