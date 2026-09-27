@@ -27,6 +27,7 @@ from konoha_build import (
     schedule_query,
     schedule_row,
     schedule_rows,
+    series_logo,
     series_search_query,
     titles_match,
     to_episodes,
@@ -403,6 +404,18 @@ check("forward window rolls the year",
       forward_months(3, datetime(2026, 11, 30, tzinfo=timezone.utc)), ["2026-11", "2026-12", "2027-01"])
 check("a window is never empty", forward_months(0, datetime(2026, 9, 12, tzinfo=timezone.utc)), ["2026-09"])
 
+
+
+# -- series_logo -------------------------------------------------------------------------------
+# 86's logos are all Japanese-tagged on TMDB, so the English-first pass caches it with none; its
+# title is the numerals, which read in any language, so an override puts TVDB's back.
+check("an override beats the cached answer", series_logo(116589, {"logo": None}),
+      "https://artworks.thetvdb.com/banners/v4/series/378609/clearlogo/612011f341f15.png")
+check("the override covers a season the pass never crawled", series_logo(131586, {}),
+      "https://artworks.thetvdb.com/banners/v4/series/378609/clearlogo/612011f341f15.png")
+check("without an override the cached logo stands", series_logo(1, {"logo": "https://x/logo.png"}),
+      "https://x/logo.png")
+check("no override and no cached logo is no logo", series_logo(1, {"logo": None}), None)
 
 if FAILURES:
     print(f"{len(FAILURES)} failure(s):\n")

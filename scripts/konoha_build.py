@@ -1263,6 +1263,24 @@ def anizip_payload(
     return {"logo": logo, "logo_source": logo_source, "ratings": ratings}
 
 
+# Logos chosen by hand, over whatever the AniZip pass cached. The English-first rule drops a
+# title's logo when TMDB holds only Japanese ones, which is right for a wordmark the viewer cannot
+# read — and wrong for one whose title *is* a number. 86's logos all carry the katakana
+# エイティシックス under the numerals, but the "86" is the title and reads in any language.
+# Applied at emit rather than in the cache, so it holds for seasons the pass never crawled and
+# survives a re-crawl that would drop it again.
+TVDB_86_LOGO = "https://artworks.thetvdb.com/banners/v4/series/378609/clearlogo/612011f341f15.png"
+LOGO_OVERRIDES: dict[int, str] = {
+    116589: TVDB_86_LOGO,  # 86 EIGHTY-SIX
+    131586: TVDB_86_LOGO,  # 86 EIGHTY-SIX Part 2
+}
+
+
+def series_logo(anilist_id: int, anizip: dict) -> str | None:
+    """The logo a title's page is written with: a hand-picked override, else the cached AniZip one."""
+    return LOGO_OVERRIDES.get(anilist_id) or anizip.get("logo") or None
+
+
 def load_anizip(anilist_id: int) -> dict:
     """One title's cached AniZip answer, or an empty one when the pass has not reached it."""
     path = ANIZIP_DIR / f"{anilist_id}.json"
@@ -1739,12 +1757,12 @@ def cmd_emit(args: argparse.Namespace) -> int:
             detail["anilist"] = app_record(entry)
             detail["series"] = series_chain(anilist_id, by_id)
             detail["recommendations"] = recommendation_nodes(entry)
-        anizip = load_anizip(anilist_id)
         # Written only when there is one. An absent key and a null both read as "no logo" to the
         # app, and the tree is served to every device on every title page — a null per title is
         # 20,811 nulls on the wire for nothing.
-        if anizip.get("logo"):
-            detail["images"]["logo"] = anizip["logo"]
+        logo = series_logo(anilist_id, load_anizip(anilist_id))
+        if logo:
+            detail["images"]["logo"] = logo
         shard = anilist_id // 1000
         _write(out / "anime" / str(shard) / str(anilist_id) / "index.json", detail)
 
