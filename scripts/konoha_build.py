@@ -1760,7 +1760,8 @@ def cmd_emit(args: argparse.Namespace) -> int:
         # Written only when there is one. An absent key and a null both read as "no logo" to the
         # app, and the tree is served to every device on every title page — a null per title is
         # 20,811 nulls on the wire for nothing.
-        logo = series_logo(anilist_id, load_anizip(anilist_id))
+        anizip = load_anizip(anilist_id)
+        logo = series_logo(anilist_id, anizip)
         if logo:
             detail["images"]["logo"] = logo
         shard = anilist_id // 1000
