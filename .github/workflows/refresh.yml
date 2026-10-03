@@ -46,7 +46,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests
+      # numpy for the recommendation graph's tag similarity: a 17,000-square cosine matrix is seconds
+      # as a blocked matrix product and the better part of an hour in plain Python.
+      - run: pip install requests numpy
 
       # Cached so an interrupted or rate-limited run resumes instead of re-walking AniList from
       # 1900. The key rotates daily so the cache never outlives the data in it.
@@ -84,6 +86,21 @@ jobs:
           if [ -f /tmp/dub-index.json ]; then cp /tmp/dub-index.json data/dub-index.json; fi
           if [ -f /tmp/dub-episodes.json ]; then cp /tmp/dub-episodes.json data/dub-episodes.json; fi
           if [ -f /tmp/filler-index.json ]; then cp /tmp/filler-index.json data/filler-index.json; fi
+
+      # The neighbour graph the app recommends from (scripts/recs_build.py). After `emit`, so an
+      # `emit --clean` rebuild cannot take it with it. `fetch` re-asks AniList for the deep recommendations
+      # of a seventh of the ~4,000 titles at the catalogue's 10-per-title cap — about a dozen
+      # requests, since one request carries 50 titles — and keeps the rest in build/konoha with the
+      # walk's own cache. Neither half may fail the refresh: a failed fetch emits from the cache,
+      # and a failed emit puts back yesterday's graph rather than committing its deletion.
+      - name: Build recommendation graph
+        run: |
+          python scripts/recs_build.py fetch \
+            || echo "::warning::deep recommendation fetch failed; emitting from the cache"
+          python scripts/recs_build.py emit --out data || {
+            echo "::warning::recommendation graph emit failed; keeping the published one"
+            git checkout HEAD -- data/recs 2>/dev/null || true
+          }
 
       # Two aliased AniList requests per month and seconds to run, so it rides along with the daily
       # refresh rather than earning a schedule of its own. Only the forward window is written: once
@@ -175,7 +192,9 @@ jobs:
         if: steps.commit.outputs.changed == 'true'
         run: |
           for repo in "${{ github.repository }}" pommieyewear/anilili-metadata; do
-            for path in dub-index.json filler-index.json dub-episodes.json index.json id-map.json airing.json stats.json sync-status.json; do
+            # recs/ sorts after anime/, so the capped diff below never reaches it either.
+            for path in dub-index.json filler-index.json dub-episodes.json index.json id-map.json airing.json stats.json sync-status.json \
+                recs/neighbours-v1.tsv.gz; do
               curl -sS "https://purge.jsdelivr.net/gh/$repo@main/data/$path" > /dev/null
             done
             # Named here rather than left to the diff below, which cannot reach them: it is capped
