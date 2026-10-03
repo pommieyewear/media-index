@@ -63,6 +63,9 @@ TMDB_API = "https://api.themoviedb.org/3"
 TMDB_STILL_BASE = "https://image.tmdb.org/t/p/w500"
 # Logos at w500: wide enough for the TV detail header, and still a PNG with its transparency.
 TMDB_LOGO_BASE = "https://image.tmdb.org/t/p/w500"
+# Backdrops at w1280, the size the app's own live lookup asks for: the TV hero draws one across
+# about two thirds of a 1080p screen, and `original` is several megabytes for no visible gain.
+TMDB_BACKDROP_BASE = "https://image.tmdb.org/t/p/w1280"
 
 # AniZip: a keyless mapping service that answers for one AniList id with TheTVDB's artwork and
 # episode rows. Two fields here are things no other source in this build has:
@@ -1170,8 +1173,26 @@ def cmd_episodes(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------------------------
 
 
-def tmdb_logo(session: requests.Session, token: str, tmdb_id: int) -> tuple[str | None, bool]:
-    """The best English logo TMDB holds for a series, and whether it holds only Japanese ones.
+def tmdb_images(session: requests.Session, token: str, tmdb_id: int) -> dict:
+    """TMDB's pictures of a series - logos and backdrops in one answer - or {} for an unknown id.
+
+    `null` is TMDB's spelling of "no language": a logo with no language and a backdrop with no
+    text on it.
+    """
+    response = session.get(
+        f"{TMDB_API}/tv/{tmdb_id}/images",
+        params={"include_image_language": "en,ja,null"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    if response.status_code == 404:
+        return {}
+    response.raise_for_status()
+    return response.json()
+
+
+def tmdb_logo(images: dict) -> tuple[str | None, bool]:
+    """The best English logo in a TMDB images answer, and whether it holds only Japanese ones.
 
     AniZip passes TVDB's clearlogo along with no language on it, and for anime that is often the
     Japanese wordmark (転生したらスライムだった件 where the viewer reads "That Time I Got
@@ -1182,16 +1203,7 @@ def tmdb_logo(session: requests.Session, token: str, tmdb_id: int) -> tuple[str 
     without an extension it recognises. Best is the highest-voted, then the most-voted, which is
     how TMDB's own site orders them.
     """
-    response = session.get(
-        f"{TMDB_API}/tv/{tmdb_id}/images",
-        params={"include_image_language": "en,ja,null"},
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
-    )
-    if response.status_code == 404:
-        return None, False
-    response.raise_for_status()
-    logos = response.json().get("logos") or []
+    logos = images.get("logos") or []
     english = [
         logo for logo in logos
         if logo.get("iso_639_1") == "en" and str(logo.get("file_path", "")).lower().endswith(".png")
@@ -1199,6 +1211,31 @@ def tmdb_logo(session: requests.Session, token: str, tmdb_id: int) -> tuple[str 
     english.sort(key=lambda logo: (logo.get("vote_average") or 0, logo.get("vote_count") or 0), reverse=True)
     japanese_only = bool(logos) and not english and all(logo.get("iso_639_1") == "ja" for logo in logos)
     return (TMDB_LOGO_BASE + english[0]["file_path"]) if english else None, japanese_only
+
+
+def pick_backdrop(tmdb_backdrops: list[dict], fanart: list[str]) -> tuple[str | None, str | None]:
+    """The landscape picture the TV hero shows for a title AniList has no banner for, and its source.
+
+    Most titles without a banner are new seasons: AniList gives a season its cover long before a
+    banner, and on 2026-10-03 14 of the 30 trending titles had none. Without a wide picture the hero
+    falls back to a blurred cover with the poster beside it.
+
+    The hero writes the title over the picture's left side, so a picture with text already on it
+    is the last resort. TMDB tags its backdrops with their text's language and `null` means no
+    text, so its text-free ones come first, highest-voted first. TheTVDB's fanart (through AniZip)
+    is next: it has no language tag, but TheTVDB's rules for fanart forbid text. TMDB's backdrops
+    with text come last.
+    """
+    usable = [b for b in tmdb_backdrops if str(b.get("file_path") or "").strip()]
+    usable.sort(key=lambda b: (b.get("vote_average") or 0, b.get("vote_count") or 0), reverse=True)
+    text_free = [b for b in usable if b.get("iso_639_1") is None]
+    if text_free:
+        return TMDB_BACKDROP_BASE + text_free[0]["file_path"], "tmdb"
+    if fanart:
+        return fanart[0], "tvdb"
+    if usable:
+        return TMDB_BACKDROP_BASE + usable[0]["file_path"], "tmdb-text"
+    return None, None
 
 
 def anizip_payload(
@@ -1235,12 +1272,14 @@ def anizip_payload(
     # Japanese logos, TVDB's is almost certainly Japanese too, so it is dropped; where TMDB knows
     # nothing, TVDB's is kept, since there is nothing to say it is not English.
     logo_source = "tvdb" if logo else None
-    if tmdb_id and tmdb_token:
-        english, japanese_only = tmdb_logo(session, tmdb_token, tmdb_id)
+    images = tmdb_images(session, tmdb_token, tmdb_id) if tmdb_id and tmdb_token else {}
+    if images:
+        english, japanese_only = tmdb_logo(images)
         if english:
             logo, logo_source = english, "tmdb-en"
         elif japanese_only:
             logo, logo_source = None, None
+    backdrop, backdrop_source = pick_backdrop(images.get("backdrops") or [], anizip_fanart(body))
 
     ratings: dict[str, float] = {}
     for key, episode in (body.get("episodes") or {}).items():
@@ -1260,7 +1299,41 @@ def anizip_payload(
         if score > 0:
             ratings[str(int(key))] = round(score, 2)
 
-    return {"logo": logo, "logo_source": logo_source, "ratings": ratings}
+    return {
+        "logo": logo,
+        "logo_source": logo_source,
+        "backdrop": backdrop,
+        "backdrop_source": backdrop_source,
+        "ratings": ratings,
+    }
+
+
+def anizip_fanart(body: dict) -> list[str]:
+    """TheTVDB's wide backdrops in an AniZip answer, in the order AniZip lists them."""
+    return [
+        image["url"]
+        for image in body.get("images") or []
+        if str(image.get("coverType", "")).lower() == "fanart" and image.get("url")
+    ]
+
+
+def anizip_tmdb_id(anilist_id: int, fribb: dict[int, "FribbEntry"]) -> int | None:
+    """The TMDB series id the AniZip pass asks TMDB about, or None.
+
+    The same one emit writes: the episode resolver's own answer first, the Fribb mapping second.
+    Never the bundled id-map, whose TMDB ids are known to be wrong. Fribb's is the TV id only, so a
+    film is never looked up as a series of the same number.
+    """
+    cached = EPISODE_DIR / f"{anilist_id}.json"
+    if cached.exists():
+        try:
+            found = json.loads(cached.read_text(encoding="utf-8")).get("tmdb_id")
+        except (OSError, json.JSONDecodeError):
+            found = None
+        if found:
+            return found
+    cross = fribb.get(anilist_id)
+    return cross.tmdb_id if cross and cross.tmdb_id else None
 
 
 # Logos chosen by hand, over whatever the AniZip pass cached. The English-first rule drops a
@@ -1279,6 +1352,16 @@ LOGO_OVERRIDES: dict[int, str] = {
 def series_logo(anilist_id: int, anizip: dict) -> str | None:
     """The logo a title's page is written with: a hand-picked override, else the cached AniZip one."""
     return LOGO_OVERRIDES.get(anilist_id) or anizip.get("logo") or None
+
+
+def hero_backdrop(banner: str | None, anizip: dict) -> str | None:
+    """The picture `backdrops.json` gives a title: the cached one, only where AniList has no banner.
+
+    A title with a banner is left out rather than written with it. The app already holds the
+    banner, from the same AniList record that put the title on its screen, so writing it here would
+    only make the file bigger. And it would be one day stale, beside a live one.
+    """
+    return None if banner else (anizip.get("backdrop") or None)
 
 
 def load_anizip(anilist_id: int) -> dict:
@@ -1326,25 +1409,13 @@ def cmd_anizip(args: argparse.Namespace) -> int:
         token = None
     fribb = load_fribb()
 
-    def tmdb_id_for(anilist_id: int) -> int | None:
-        cached = EPISODE_DIR / f"{anilist_id}.json"
-        if cached.exists():
-            try:
-                found = json.loads(cached.read_text(encoding="utf-8")).get("tmdb_id")
-            except (OSError, json.JSONDecodeError):
-                found = None
-            if found:
-                return found
-        cross = fribb.get(anilist_id)
-        return cross.tmdb_id if cross and cross.tmdb_id else None
-
     done = 0
     with_logo = 0
     with_ratings = 0
     for entry in targets:
         anilist_id = entry["id"]
         try:
-            payload = anizip_payload(session, anilist_id, tmdb_id_for(anilist_id), token)
+            payload = anizip_payload(session, anilist_id, anizip_tmdb_id(anilist_id, fribb), token)
         except Exception as error:  # noqa: BLE001 - one bad title must not end an hours-long run
             print(f"  !! {anilist_id} {error}", flush=True)
             time.sleep(ANIZIP_MIN_INTERVAL)
@@ -1687,6 +1758,10 @@ def cmd_emit(args: argparse.Namespace) -> int:
     years: dict[str, int] = {}
     formats: dict[str, int] = {}
     statuses: dict[str, int] = {}
+    # AniList id -> landscape picture for the TV hero, for titles with no banner; see hero_backdrop.
+    # One file rather than a field in each index.json: Home shows a dozen titles at once and opens
+    # none of their pages, so per-title files would be a dozen reads before the hero could draw.
+    backdrops: dict[str, str] = {}
     episode_count = 0
 
     by_id = {entry["id"]: entry for entry in catalog}
@@ -1764,6 +1839,9 @@ def cmd_emit(args: argparse.Namespace) -> int:
         logo = series_logo(anilist_id, anizip)
         if logo:
             detail["images"]["logo"] = logo
+        backdrop = hero_backdrop(entry.get("bannerImage"), anizip)
+        if backdrop:
+            backdrops[str(anilist_id)] = backdrop
         shard = anilist_id // 1000
         _write(out / "anime" / str(shard) / str(anilist_id) / "index.json", detail)
 
@@ -1841,6 +1919,7 @@ def cmd_emit(args: argparse.Namespace) -> int:
     _write(out / "index.json", index_rows)
     _write(out / "id-map.json", id_map)
     _write(out / "airing.json", airing)
+    _write(out / "backdrops.json", {"v": 1, "titles": backdrops})
     _write(out / "genres.json", sorted(genres))
     _write(out / "years.json", sorted(years, reverse=True))
     _write(
@@ -1861,6 +1940,7 @@ def cmd_emit(args: argparse.Namespace) -> int:
     print(f"titles      {len(index_rows)}")
     print(f"episodes    {episode_count}")
     print(f"airing      {len(airing)}")
+    print(f"backdrops   {len(backdrops)}")
     print(f"tmdb linked {sum(1 for v in id_map.values() if v['tmdb'])}")
     print(f"\nwrote {out}")
     return 0

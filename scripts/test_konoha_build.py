@@ -18,9 +18,11 @@ from konoha_build import (
     _iso_air_date,
     far_year_season,
     forward_months,
+    hero_backdrop,
     is_sequel,
     normalize_title,
     opens_when_season_does,
+    pick_backdrop,
     pick_group,
     pick_season,
     schedule_days,
@@ -416,6 +418,30 @@ check("the override covers a season the pass never crawled", series_logo(131586,
 check("without an override the cached logo stands", series_logo(1, {"logo": "https://x/logo.png"}),
       "https://x/logo.png")
 check("no override and no cached logo is no logo", series_logo(1, {"logo": None}), None)
+
+# -- pick_backdrop / hero_backdrop -------------------------------------------------------------
+# The hero sets the title over the picture's left side, so text already in the picture loses to a
+# lower-voted picture without it, and TheTVDB's fanart (text forbidden there) beats TMDB with text.
+W1280 = "https://image.tmdb.org/t/p/w1280"
+TEXT_FREE = {"file_path": "/free.jpg", "iso_639_1": None, "vote_average": 5.1, "vote_count": 2}
+TEXT_FREE_TOP = {"file_path": "/free-top.jpg", "iso_639_1": None, "vote_average": 5.4, "vote_count": 1}
+ENGLISH_TEXT = {"file_path": "/en.jpg", "iso_639_1": "en", "vote_average": 9.0, "vote_count": 40}
+FANART = ["https://artworks.thetvdb.com/banners/fanart/original/1.jpg"]
+check("text-free TMDB beats higher-voted TMDB with text",
+      pick_backdrop([ENGLISH_TEXT, TEXT_FREE], FANART), (W1280 + "/free.jpg", "tmdb"))
+check("text-free TMDB goes by votes",
+      pick_backdrop([TEXT_FREE, TEXT_FREE_TOP], []), (W1280 + "/free-top.jpg", "tmdb"))
+check("TheTVDB's fanart beats TMDB with text",
+      pick_backdrop([ENGLISH_TEXT], FANART), (FANART[0], "tvdb"))
+check("TMDB with text is the last resort",
+      pick_backdrop([ENGLISH_TEXT], []), (W1280 + "/en.jpg", "tmdb-text"))
+check("a backdrop with no file is not one",
+      pick_backdrop([{"file_path": "", "iso_639_1": None}], []), (None, None))
+check("a title with a banner is left out of backdrops.json",
+      hero_backdrop("https://s4.anilist.co/banner.jpg", {"backdrop": W1280 + "/free.jpg"}), None)
+check("a title without one gets the cached picture",
+      hero_backdrop(None, {"backdrop": W1280 + "/free.jpg"}), W1280 + "/free.jpg")
+check("a cache row from before backdrops gives none", hero_backdrop(None, {"logo": None}), None)
 
 if FAILURES:
     print(f"{len(FAILURES)} failure(s):\n")

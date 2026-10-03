@@ -193,7 +193,7 @@ jobs:
         run: |
           for repo in "${{ github.repository }}" pommieyewear/anilili-metadata; do
             # recs/ sorts after anime/, so the capped diff below never reaches it either.
-            for path in dub-index.json filler-index.json dub-episodes.json index.json id-map.json airing.json stats.json sync-status.json \
+            for path in dub-index.json filler-index.json dub-episodes.json backdrops.json index.json id-map.json airing.json stats.json sync-status.json \
                 recs/neighbours-v1.tsv.gz; do
               curl -sS "https://purge.jsdelivr.net/gh/$repo@main/data/$path" > /dev/null
             done
