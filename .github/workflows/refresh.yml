@@ -20,6 +20,10 @@ on:
         description: "Re-fetch every title from TMDB, not just airing ones"
         type: boolean
         default: false
+      ids:
+        description: "Also re-fetch these AniList ids from TMDB (comma-separated), e.g. after a matcher change"
+        type: string
+        default: ""
 
 concurrency:
   # Two refreshes pushing the same tree would conflict on the commit, and the loser's work is lost
@@ -61,14 +65,26 @@ jobs:
       - name: Walk AniList
         run: python scripts/konoha_build.py catalog
 
+      # `ids` re-fetches finished titles the airing pass never revisits. That matters because emit
+      # deletes an episodes.json whose cached answer is empty: a list published by hand for a
+      # finished title survives only once this cache holds the same answer, and this is how it gets
+      # there without a five-hour full run. Passed through env, never spliced into the script.
       - name: Fetch episode lists
         env:
           TMDB_READ_TOKEN: ${{ secrets.TMDB_READ_TOKEN }}
+          REFETCH_IDS: ${{ inputs.ids }}
         run: |
+          # The committed AniZip answers carry the air dates the near-count season check reads, and
+          # the emit step's copy below comes too late for it.
+          mkdir -p build/konoha/anizip
+          if [ -d anizip ]; then cp -r anizip/. build/konoha/anizip/; fi
           if [ "${{ inputs.full }}" = "true" ]; then
             python scripts/konoha_build.py episodes --out data
           else
             python scripts/konoha_build.py episodes --out data --airing-only
+          fi
+          if [ -n "$REFETCH_IDS" ]; then
+            python scripts/konoha_build.py episodes --out data --ids "$REFETCH_IDS"
           fi
 
       # AniZip answers (the series' clearlogo and per-episode scores) are fetched off this runner by

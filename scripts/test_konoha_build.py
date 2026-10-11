@@ -12,11 +12,16 @@ test dependency to publish an APK is not a trade worth making.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from konoha_build import (
     _iso_air_date,
+    anizip_airdates,
+    dated_run_agrees,
     far_year_season,
+    movie_episode_title,
+    movies_to_episodes,
+    near_count_season,
     forward_months,
     hero_backdrop,
     is_sequel,
@@ -24,6 +29,7 @@ from konoha_build import (
     opens_when_season_does,
     pick_backdrop,
     pick_group,
+    pick_movie_run,
     pick_season,
     schedule_days,
     schedule_query,
@@ -31,6 +37,7 @@ from konoha_build import (
     schedule_rows,
     series_logo,
     series_search_query,
+    strip_format_markers,
     titles_match,
     to_episodes,
     whole_series_seasons,
@@ -407,6 +414,52 @@ check("forward window rolls the year",
 check("a window is never empty", forward_months(0, datetime(2026, 9, 12, tzinfo=timezone.utc)), ["2026-09"])
 
 
+# -- pick_movie_run ----------------------------------------------------------------------------
+# AniList 100049, Re:ZERO's two OVAs, which TMDB keeps as the films 532321 and 566451 — released on
+# exactly the entry's start and end dates. TMDB's /search/movie answer, measured 2026-09-27, also
+# carries 1351929, a 2016 film under the bare series name; only its date says it is something else.
+re_zero_ovas = {
+    "title": {
+        "romaji": "Re:Zero kara Hajimeru Isekai Seikatsu OVAs",
+        "english": "Re:ZERO -Starting Life in Another World- OVAs",
+        "native": "Re:ゼロから始める異世界生活 OVAs",
+    },
+    "format": "OVA",
+    "episodes": 2,
+    "startDate": {"year": 2018, "month": 10, "day": 6},
+    "endDate": {"year": 2019, "month": 11, "day": 8},
+}
+re_zero_films = [
+    {"id": 566451, "title": "Re:ZERO -Starting Life in Another World- The Frozen Bond",
+     "original_title": "Re:ゼロから始める異世界生活 氷結の絆", "release_date": "2019-11-08",
+     "backdrop_path": "/frozen.jpg"},
+    {"id": 1351929, "title": "Re:ZERO -Starting Life in Another World-",
+     "original_title": "Re:ゼロから始める異世界生活　劇場型悪意", "release_date": "2016-04-04"},
+    {"id": 532321, "title": "Re:ZERO -Starting Life in Another World- Memory Snow",
+     "original_title": "Re:ゼロから始める異世界生活 Memory Snow", "release_date": "2018-10-06",
+     "backdrop_path": "/snow.jpg"},
+]
+run = pick_movie_run(re_zero_ovas, re_zero_films)
+check("OVAs kept as films become the episodes, in release order",
+      [m["id"] for m in run or []], [532321, 566451])
+check("the episode title is the part after the series name",
+      [movie_episode_title(re_zero_ovas, m) for m in run or []], ["Memory Snow", "The Frozen Bond"])
+check("a film's backdrop stands in for the still",
+      [row["still"] for row in movies_to_episodes(re_zero_ovas, run or [])],
+      ["https://image.tmdb.org/t/p/w500/snow.jpg", "https://image.tmdb.org/t/p/w500/frozen.jpg"])
+check("films that do not account for the whole entry are refused",
+      pick_movie_run(re_zero_ovas, [f for f in re_zero_films if f["id"] == 532321]), None)
+check("a count that disagrees is refused", pick_movie_run({**re_zero_ovas, "episodes": 3}, re_zero_films), None)
+check("another title's film is never taken on its date alone",
+      pick_movie_run({**re_zero_ovas, "episodes": 1},
+                     [{"id": 9, "title": "Some Other Film", "original_title": "Some Other Film",
+                       "release_date": "2018-10-06"}]),
+      None)
+check("the format word is not part of the name",
+      strip_format_markers("Re:ZERO -Starting Life in Another World- OVAs"),
+      "Re:ZERO -Starting Life in Another World-")
+
+
 
 # -- series_logo -------------------------------------------------------------------------------
 # 86's logos are all Japanese-tagged on TMDB, so the English-first pass caches it with none; its
@@ -442,6 +495,61 @@ check("a title with a banner is left out of backdrops.json",
 check("a title without one gets the cached picture",
       hero_backdrop(None, {"backdrop": W1280 + "/free.jpg"}), W1280 + "/free.jpg")
 check("a cache row from before backdrops gives none", hero_backdrop(None, {"logo": None}), None)
+
+# -- near_count_season / dated_run_agrees -----------------------------------------------------
+# CLANNAD is 23 episodes on AniList and season 1 of TMDB 24835 is 22: AniList counts the "Another
+# World" OVA that TMDB files under specials. Every exact-count rule refused it, so the dataset held
+# the series id and no episodes, and the app drew 23 black thumbnails.
+CLANNAD = [
+    {"season_number": 0, "episode_count": 5, "air_date": "2008-03-28"},
+    {"season_number": 1, "episode_count": 22, "air_date": "2007-10-05"},
+    {"season_number": 2, "episode_count": 22, "air_date": "2008-10-03"},
+]
+check("a season one short that opens the same day", near_count_season(CLANNAD, 23, "2007-10-05"), CLANNAD[1])
+check("After Story, two short", near_count_season(CLANNAD, 24, "2008-10-03"), CLANNAD[2])
+check("an opener a year out is not the season", near_count_season(CLANNAD, 23, "2006-10-05"), None)
+check("three short of 23 is too far", near_count_season(CLANNAD, 25, "2007-10-05"), None)
+check("two short of a 13-episode run is too far", near_count_season(
+    [{"season_number": 1, "episode_count": 11, "air_date": "2020-01-01"}], 13, "2020-01-01"), None)
+check("a short run gets no slack at all", near_count_season(
+    [{"season_number": 1, "episode_count": 2, "air_date": "2021-06-02"}], 3, "2021-06-02"), None)
+check("no start date, no opener to agree with", near_count_season(CLANNAD, 23, None), None)
+
+
+def weekly(first: str, count: int) -> list[str]:
+    start = datetime.strptime(first, "%Y-%m-%d")
+    return [(start + timedelta(days=7 * week)).strftime("%Y-%m-%d") for week in range(count)]
+
+
+CLANNAD_DATES = weekly("2007-10-05", 23)
+CLANNAD_RUN = [{"air_date": date} for date in CLANNAD_DATES[:22]]
+check("the run agrees date for date", dated_run_agrees(CLANNAD_RUN, CLANNAD_DATES, 23), True)
+check("a day either side still agrees", dated_run_agrees(
+    [{"air_date": d} for d in weekly("2008-01-08", 12)], weekly("2008-01-09", 12), 13), True)
+# Outlaw Star: TMDB's 16th episode is the one Japan never broadcast, so every episode after it sits a
+# place late. The count is two over and the opener agrees, which is exactly why dates are required.
+OUTLAW = [{"air_date": d} for d in weekly("1998-01-09", 15)] + [{"air_date": "1998-12-18"}] + [
+    {"air_date": d} for d in weekly("1998-04-24", 10)
+]
+check("an episode inserted mid-run is refused", dated_run_agrees(OUTLAW, weekly("1998-01-09", 24), 24), False)
+check("a date missing on either side is a refusal", dated_run_agrees(
+    CLANNAD_RUN, CLANNAD_DATES[:5] + [None] + CLANNAD_DATES[6:], 23), False)
+check("AniZip shorter than the run used is a refusal", dated_run_agrees(CLANNAD_RUN, CLANNAD_DATES[:10], 23), False)
+check("a longer run is judged only as far as the entry goes", dated_run_agrees(
+    [{"air_date": d} for d in weekly("2008-01-06", 12)] + [{"air_date": "2009-01-01"}],
+    weekly("2008-01-06", 12), 12), True)
+
+# AniZip's dates are kept in the `anizip` cache for the runner, which never asks AniZip itself.
+check("dates in episode order, specials ignored", anizip_airdates({"episodes": {
+    "2": {"airdate": "2007-10-12"}, "1": {"airDate": "2007-10-05T00:00:00Z"}, "S1": {"airdate": "2008-01-01"},
+}}), ["2007-10-05", "2007-10-12"])
+check("an undated episode keeps its place", anizip_airdates({"episodes": {
+    "1": {"airdate": "2007-10-05"}, "2": {}, "3": {"airdate": "2007-10-19"},
+}}), ["2007-10-05", None, "2007-10-19"])
+check("a gap in the numbering is no answer", anizip_airdates({"episodes": {
+    "1": {"airdate": "2007-10-05"}, "3": {"airdate": "2007-10-19"},
+}}), [])
+check("nothing known, nothing kept", anizip_airdates({}), [])
 
 if FAILURES:
     print(f"{len(FAILURES)} failure(s):\n")

@@ -229,6 +229,12 @@ SEASON_YEAR_SLACK = 1
 # first. Wide enough for a premiere screened early or held back a fortnight, and nowhere near the
 # months that separate one season from the next. Matches the app's own SEASON_OPENER_TOLERANCE_DAYS.
 SEASON_OPENER_TOLERANCE_DAYS = 21
+# A near-count season (see `near_count_season`) must agree with AniZip's broadcast date at every
+# episode it is used for, to within this many days: enough for a midnight broadcast filed on either
+# side of it, and less than the week that separates one weekly episode from the next.
+NEAR_COUNT_DATE_TOLERANCE_DAYS = 2
+# Below this many episodes, one episode off is too large a share of the run to call it the same one.
+NEAR_COUNT_MIN_EPISODES = 4
 
 
 def series_search_query(raw: str | None) -> str | None:
@@ -284,6 +290,111 @@ def _year_of(date: str | None) -> int | None:
         return int(date[:4])
     except ValueError:
         return None
+
+
+# The AniList formats whose episodes TMDB may keep as films instead of as a season, and how many
+# films one entry may stand for before that stops being the pattern. Mirrors TmdbClient.kt.
+MOVIE_RUN_FORMATS = {"MOVIE", "OVA", "ONA", "SPECIAL"}
+MAX_MOVIE_RUN = 6
+
+FORMAT_MARKERS = re.compile(
+    r"\b(the\s+movie|movies?|gekijou-?ban|ovas?|oads?|onas?|specials?)\b", re.I
+)
+
+
+def strip_format_markers(raw: str | None) -> str | None:
+    """A title without the words that say what kind of release it is rather than what it is called."""
+    if not raw or not raw.strip():
+        return None
+    text = WHITESPACE.sub(" ", FORMAT_MARKERS.sub(" ", raw)).strip()
+    return text or None
+
+
+def movie_search_queries(entry: dict) -> list[str]:
+    """What to search TMDB's films for: each title as written, and without its format word."""
+    titles = entry.get("title") or {}
+    queries: list[str] = []
+    for raw in (titles.get("english"), titles.get("romaji")):
+        for candidate in (raw.strip() if raw else None, strip_format_markers(raw)):
+            if candidate and candidate not in queries:
+                queries.append(candidate)
+    return queries
+
+
+def _whole_date(value: dict | None) -> datetime | None:
+    iso = _iso_air_date(value)
+    return datetime.strptime(iso, "%Y-%m-%d") if iso else None
+
+
+def pick_movie_run(entry: dict, movies: list[dict]) -> list[dict] | None:
+    """The films that are an entry's episodes, in episode order, or None unless they account for it.
+
+    Port of `pickMovieRun`. Each film's title must contain the entry's own name once "OVA"/"Movie"
+    are taken off it; each must be released within the entry's run, start date to end date, with the
+    slack a season opener gets; and the count must equal the entry's episode count. Re:ZERO's OVAs
+    (AniList 100049) are TMDB films 532321 and 566451, released on exactly its start and end dates;
+    the date window is what keeps out the 2016 film TMDB files under the bare series name.
+    """
+    wanted = entry.get("episodes")
+    start = _whole_date(entry.get("startDate"))
+    if not wanted or not start:
+        return None
+    end = _whole_date(entry.get("endDate")) or start
+    titles = entry.get("title") or {}
+    bases = []
+    for raw in (titles.get("romaji"), titles.get("english"), titles.get("native")):
+        base = normalize_title(strip_format_markers(raw))
+        if len(base) >= MIN_TITLE_LENGTH and base not in bases:
+            bases.append(base)
+    if not bases:
+        return None
+    slack = timedelta(days=SEASON_OPENER_TOLERANCE_DAYS)
+    seen: set[int] = set()
+    run = []
+    for movie in movies:
+        if movie.get("id") in seen:
+            continue
+        seen.add(movie.get("id"))
+        try:
+            released = datetime.strptime((movie.get("release_date") or "")[:10], "%Y-%m-%d")
+        except ValueError:
+            continue
+        if released < start - slack or released > end + slack:
+            continue
+        theirs = [normalize_title(movie.get(k)) for k in ("title", "original_title")]
+        if any(base in title for title in theirs if title for base in bases):
+            run.append(movie)
+    run.sort(key=lambda m: m.get("release_date") or "")
+    return run if len(run) == wanted else None
+
+
+def movie_episode_title(entry: dict, movie: dict) -> str | None:
+    """A film's title as an episode title: the part after the series name ("Memory Snow")."""
+    title = (movie.get("title") or "").strip()
+    if not title:
+        return None
+    titles = entry.get("title") or {}
+    for raw in (titles.get("english"), titles.get("romaji")):
+        prefix = strip_format_markers(raw)
+        if prefix and len(prefix) >= MIN_TITLE_LENGTH and title.lower().startswith(prefix.lower()):
+            rest = title[len(prefix):].strip(" -:–—~")
+            return rest or title
+    return title
+
+
+def movies_to_episodes(entry: dict, run: list[dict]) -> list[dict]:
+    """A run of films in Konoha's episode shape; a film's backdrop stands in for a still."""
+    return to_episodes(
+        [
+            {
+                "name": movie_episode_title(entry, movie),
+                "overview": movie.get("overview"),
+                "air_date": movie.get("release_date"),
+                "still_path": movie.get("backdrop_path"),
+            }
+            for movie in run
+        ]
+    )
 
 
 def _days_apart(date: str | None, other: str | None) -> int | None:
@@ -429,6 +540,93 @@ def far_year_season(
     if len(same_count) != 1 or _year_is_near(same_count[0].get("air_date"), wanted_year):
         return None
     return same_count[0]
+
+
+def near_count_season(
+    seasons: list[dict], wanted_episodes: int | None, wanted_start: str | None
+) -> dict | None:
+    """The one TMDB season that opens the day the entry does and is *nearly* its length.
+
+    Every rule above treats the episode count as binding, and over a thousand finished titles fail
+    on it by one or two: AniList counts an OVA or a recap that TMDB files under specials. CLANNAD is
+    23 episodes on AniList and 22 on TMDB, After Story 24 against 22, and both sat in the dataset
+    with no titles and no stills at all. This is the candidate for those, and *only* a candidate:
+    a near count is also what an episode inserted or merged mid-run looks like (Outlaw Star's
+    unaired episode is TMDB's 16th, TEXHNOLYZE's last four are three), and taken by position that
+    puts the wrong title on every episode after it. So the caller has to prove the run with
+    [dated_run_agrees] before using it.
+
+    The opener has to agree as well as the length, and exactly one season may qualify.
+    """
+    if not wanted_episodes or wanted_episodes < NEAR_COUNT_MIN_EPISODES or not wanted_start:
+        return None
+    slack = 2 if wanted_episodes >= 20 else 1
+    def opens_with_entry(season: dict) -> bool:
+        distance = _days_apart(season.get("air_date"), wanted_start)
+        return distance is not None and distance <= SEASON_OPENER_TOLERANCE_DAYS
+
+    near = [
+        s
+        for s in seasons
+        if (s.get("season_number") or 0) > 0
+        and (s.get("episode_count") or 0) > 0
+        and abs(s["episode_count"] - wanted_episodes) <= slack
+        and opens_with_entry(s)
+    ]
+    return near[0] if len(near) == 1 else None
+
+
+def dated_run_agrees(raw: list[dict], broadcast_dates: list[str | None], wanted_episodes: int) -> bool:
+    """Whether a TMDB run is this entry's episodes position by position, judged by air date.
+
+    [broadcast_dates] is AniZip's air date for each of the entry's episodes in order. Every
+    position the run will be used for — the shorter of the run and the entry — must carry a date
+    on both sides, and the two must agree. A missing date is a refusal, not a pass: this is the
+    only evidence that the run has no episode inserted or merged in the middle.
+    """
+    used = min(len(raw), wanted_episodes)
+    if used == 0 or len(broadcast_dates) < used:
+        return False
+    for episode, broadcast in zip(raw[:used], broadcast_dates[:used]):
+        distance = _days_apart(episode.get("air_date"), broadcast)
+        if distance is None or distance > NEAR_COUNT_DATE_TOLERANCE_DAYS:
+            return False
+    return True
+
+
+def anizip_broadcast_dates(anilist_id: int) -> list[str | None]:
+    """AniZip's air date for each numbered episode of one AniList entry, in order; empty on failure.
+
+    From the `anizip` cache when the pass has stored them (`airdates`), which is how the daily runner
+    gets them: it never asks AniZip itself, and the cache is committed alongside the tree. Otherwise
+    fetched live, which only ever happens for the handful of titles that reach [near_count_season].
+    Sent without the TMDB session, whose token is not AniZip's business.
+    """
+    cached = load_anizip(anilist_id).get("airdates")
+    if isinstance(cached, list):
+        return cached
+    with _ANIZIP_LOCK:
+        global _ANIZIP_LAST
+        wait = _ANIZIP_LAST + ANIZIP_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _ANIZIP_LAST = time.monotonic()
+    try:
+        response = requests.get(
+            ANIZIP_API,
+            params={"anilist_id": anilist_id},
+            headers={"User-Agent": "anilili-media-index/1.0"},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return []
+        return anizip_airdates(response.json() or {})
+    except (requests.RequestException, ValueError):
+        return []
+
+
+_ANIZIP_LOCK = threading.Lock()
+_ANIZIP_LAST = 0.0
 
 
 def _year_is_near(air_date: str | None, wanted_year: int | None) -> bool:
@@ -979,7 +1177,10 @@ class Tmdb:
         # a dead mirror. It still has to survive titles_match like any other candidate.
         series = self.resolve_series(entry, fribb.tmdb_id if fribb and fribb.tmdb_id else hint_id)
         if not series:
-            return (to_episodes(held), fribb.tmdb_id) if held else ([], None)
+            if held:
+                return to_episodes(held), fribb.tmdb_id
+            # The films carry no series id: they are not episodes of any TMDB series.
+            return self.movie_run(entry), None
         series_id = series.get("id")
         start = entry.get("startDate") or {}
         wanted_year = entry.get("seasonYear") or start.get("year")
@@ -1054,7 +1255,34 @@ class Tmdb:
             raw = (payload or {}).get("episodes") or []
             if raw:
                 return to_episodes(raw), series_id
+        # Nothing matches the count exactly, and a season that opens the same day and is one or two
+        # episodes off is taken — but only once AniZip's dates say it is the same run, episode by
+        # episode, and only as far as the entry reaches. See `near_count_season`.
+        near = near_count_season(seasons, wanted_episodes, wanted_start)
+        if near:
+            payload = self.get(f"/tv/{series_id}/season/{near['season_number']}")
+            raw = (payload or {}).get("episodes") or []
+            if raw and dated_run_agrees(raw, anizip_broadcast_dates(entry["id"]), wanted_episodes):
+                return to_episodes(raw[:wanted_episodes]), series_id
+        # Last: the entry is not on the series at all because TMDB keeps its episodes as films.
+        films = self.movie_run(entry)
+        if films:
+            return films, None
         return [], series_id
+
+    def movie_run(self, entry: dict) -> list[dict]:
+        """An OVA entry whose episodes TMDB keeps as separate films; see `pick_movie_run`."""
+        if entry.get("format") not in MOVIE_RUN_FORMATS:
+            return []
+        wanted = entry.get("episodes")
+        if not wanted or not 1 <= wanted <= MAX_MOVIE_RUN:
+            return []
+        found: list[dict] = []
+        for query in movie_search_queries(entry):
+            payload = self.get(f"/search/movie?query={requests.utils.quote(query)}")
+            found.extend((payload or {}).get("results") or [])
+        run = pick_movie_run(entry, found)
+        return movies_to_episodes(entry, run) if run else []
 
     def specials_episode(
         self, entry: dict, series_id: int, wanted_episodes: int | None
@@ -1102,6 +1330,14 @@ def tmdb_token(explicit: str | None) -> str:
     )
 
 
+def episode_ids_arg(raw: str | None) -> set[int] | None:
+    """The `--ids` set: `1,2,3`, or `@path` naming a file of one id per line. None when not given."""
+    if not raw:
+        return None
+    text = pathlib.Path(raw[1:]).read_text(encoding="utf-8") if raw.startswith("@") else raw
+    return {int(token) for token in re.split(r"[\s,]+", text) if token.strip()}
+
+
 def cmd_episodes(args: argparse.Namespace) -> int:
     catalog = load_catalog()
     EPISODE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1121,9 +1357,15 @@ def cmd_episodes(args: argparse.Namespace) -> int:
         if value.get("tmdb") and value.get("tmdb_type") != "movie":
             hints[int(key)] = value["tmdb"]
 
+    only = episode_ids_arg(args.ids)
     targets = []
     for entry in catalog:
         if entry.get("format") not in EPISODIC_FORMATS:
+            continue
+        if only is not None:
+            # Named titles are re-fetched whatever the cache holds: naming one is the request.
+            if entry["id"] in only:
+                targets.append(entry)
             continue
         if args.airing_only and entry.get("status") not in {"RELEASING", "NOT_YET_RELEASED"}:
             continue
@@ -1305,7 +1547,27 @@ def anizip_payload(
         "backdrop": backdrop,
         "backdrop_source": backdrop_source,
         "ratings": ratings,
+        # Only when there are any: a title AniZip does not know stays the small empty answer.
+        **({"airdates": airdates} if (airdates := anizip_airdates(body)) else {}),
     }
+
+
+def anizip_airdates(body: dict) -> list[str | None]:
+    """AniZip's air date for each numbered episode, in order; empty unless numbered 1..n unbroken.
+
+    Kept in the `anizip` cache because [near_count_season] needs it at emit time on the daily
+    runner, which never asks AniZip itself. A gap in the numbering would put every date after it
+    on the wrong episode, so a broken run is no answer at all.
+    """
+    numbered = sorted(
+        (int(key), value) for key, value in (body.get("episodes") or {}).items() if key.isdigit()
+    )
+    if [number for number, _ in numbered] != list(range(1, len(numbered) + 1)):
+        return []
+    return [
+        ((value or {}).get("airdate") or (value or {}).get("airDate") or "")[:10] or None
+        for _, value in numbered
+    ]
 
 
 def anizip_fanart(body: dict) -> list[str]:
@@ -1379,8 +1641,14 @@ def cmd_anizip(args: argparse.Namespace) -> int:
     catalog = load_catalog()
     ANIZIP_DIR.mkdir(parents=True, exist_ok=True)
 
+    only = episode_ids_arg(args.ids)
     targets = []
     for entry in catalog:
+        if only is not None:
+            # Named titles are re-fetched whatever the cache holds: naming one is the request.
+            if entry["id"] in only:
+                targets.append(entry)
+            continue
         if args.airing_only and entry.get("status") not in {"RELEASING", "NOT_YET_RELEASED"}:
             continue
         if (ANIZIP_DIR / f"{entry['id']}.json").exists() and not args.refresh:
@@ -2031,6 +2299,10 @@ def main(argv: list[str]) -> int:
         "--refresh-fribb", action="store_true", help="re-download the cross-reference before running"
     )
     episodes.add_argument(
+        "--ids",
+        help="re-fetch only these AniList ids: comma-separated, or @file with one id per line",
+    )
+    episodes.add_argument(
         "--airing-only",
         action="store_true",
         help="only RELEASING/NOT_YET_RELEASED titles — the daily refresh",
@@ -2047,6 +2319,10 @@ def main(argv: list[str]) -> int:
         help="walk the catalogue most-opened first, so a short run still covers what viewers see",
     )
     anizip.add_argument("--refresh", action="store_true", help="re-fetch titles already cached")
+    anizip.add_argument(
+        "--ids",
+        help="fetch only these AniList ids: comma-separated, or @file with one id per line",
+    )
     anizip.add_argument(
         "--airing-only",
         action="store_true",
